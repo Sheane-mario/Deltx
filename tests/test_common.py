@@ -1,12 +1,12 @@
 """Tests for the common module."""
 
-from deltx.common.config import Config
+from deltx.common.config import DeltxConfig
 from deltx.common.exceptions import DeltxError
 
 
 def test_config_instantiates() -> None:
-    config = Config()
-    assert isinstance(config, Config)
+    config = DeltxConfig()
+    assert isinstance(config, DeltxConfig)
 
 
 def test_deltx_error_is_exception() -> None:

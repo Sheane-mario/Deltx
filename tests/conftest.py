@@ -2,10 +2,10 @@
 
 import pytest
 
-from deltx.common.config import Config
+from deltx.common.config import DeltxConfig
 
 
 @pytest.fixture
-def config() -> Config:
-    """Provide a default Config instance."""
-    return Config()
+def config() -> DeltxConfig:
+    """Provide a default DeltxConfig instance."""
+    return DeltxConfig()
