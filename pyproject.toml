@@ -31,18 +31,35 @@ pre-commit = "^3.7"
 [tool.ruff]
 target-version = "py312"
 line-length = 88
+src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "ANN", "S", "B"]
+# ANN101/ANN102 (annotating self/cls) are deprecated in ruff and add no value.
+ignore = ["ANN101", "ANN102"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests rely on `assert`; the language-model import guard is intentionally broad.
+"tests/**" = ["S101"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
 
+[[tool.mypy.overrides]]
+# transformers ships only partial type information; treat it as untyped so
+# strict mode does not flag every model/tokenizer call as an untyped call.
+module = ["transformers.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--cov=deltx --cov-report=term-missing -v"
+markers = [
+    "slow: tests that require the language model to be downloaded/cached",
+]
 
 [build-system]
 requires = ["poetry-core"]
