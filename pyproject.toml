@@ -54,6 +54,12 @@ module = ["transformers.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
+[[tool.mypy.overrides]]
+# scipy ships no type stubs (scipy-stubs is a separate, unbundled package).
+module = ["scipy.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--cov=deltx --cov-report=term-missing -v"
