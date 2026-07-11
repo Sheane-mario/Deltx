@@ -48,6 +48,10 @@ ignore = ["ANN101", "ANN102"]
 [tool.ruff.lint.per-file-ignores]
 # Tests rely on `assert`; the language-model import guard is intentionally broad.
 "tests/**" = ["S101"]
+# The classifier follows scikit-learn's ML naming convention (`X` for feature
+# matrices, `y` for labels), which N803/N806 would otherwise reject as non-snake.
+"src/deltx/detection/classifier.py" = ["N803", "N806"]
+"tests/detection/test_classifier.py" = ["N803", "N806"]
 
 [tool.ruff.lint.flake8-bugbear]
 # `Path(...)` is immutable, so it is safe as a default argument value.
@@ -80,6 +84,13 @@ follow_imports = "skip"
 [[tool.mypy.overrides]]
 # pandas ships no py.typed marker (pandas-stubs is a separate, unbundled package).
 module = ["pandas.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+# xgboost, shap, and joblib ship no usable type information under strict mode;
+# treat them as untyped so their calls are not flagged as untyped-call errors.
+module = ["xgboost.*", "shap.*", "joblib.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
