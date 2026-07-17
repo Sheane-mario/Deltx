@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,7 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 from rich.console import Console
+from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.table import Table
 from sklearn.model_selection import train_test_split
@@ -49,15 +51,32 @@ from sklearn.model_selection import train_test_split
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from deltx.common.config import DeltxConfig  # noqa: E402
-from deltx.common.exceptions import DeltxError  # noqa: E402
+from deltx.common.exceptions import DeltxError, ProvenanceError  # noqa: E402
+from deltx.common.provenance import (  # noqa: E402
+    Evaluation,
+    LeaveOneModelOut,
+    RunManifest,
+    ShippedArtifact,
+    SplitSizes,
+    build_provenance,
+    fingerprint_dataset,
+    make_run_id,
+    sha256_file,
+    utc_now_iso,
+    write_run,
+)
 from deltx.detection.classifier import DetectionClassifier  # noqa: E402
 from deltx.detection.dataset import DatasetManager  # noqa: E402
 from deltx.detection.models import FeatureVector  # noqa: E402
 
 logger = logging.getLogger(__name__)
-console = Console()
+# record=True keeps every printed line so the run capture can persist the report
+# verbatim, rather than reformatting the results a second time.
+console = Console(record=True)
 
 DEFAULT_FEATURES = Path("data/processed/train_features.parquet")
+DEFAULT_RUNS_ROOT = Path("data/runs")
+REPO_ROOT = Path(__file__).resolve().parents[1]
 VAL_FRACTION = 0.1
 TEST_FRACTION = 0.2
 TOP_FEATURES_SHOWN = 5
@@ -94,6 +113,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-tune",
         action="store_true",
         help="Skip hyperparameter search (fast dry run with default params).",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=DEFAULT_RUNS_ROOT,
+        help="Directory holding captured runs (manifest, report, index).",
+    )
+    parser.add_argument(
+        "--tag",
+        type=str,
+        default=None,
+        help="Short label appended to the run id, e.g. 'no-codenet'.",
+    )
+    parser.add_argument(
+        "--no-capture",
+        action="store_true",
+        help="Skip writing the run manifest (results will not be reproducible).",
     )
     return parser.parse_args(argv)
 
@@ -143,13 +179,24 @@ def to_xy(frame: pd.DataFrame) -> tuple[FloatArray, IntArray]:
     return x, y
 
 
+def _best_iteration(classifier: DetectionClassifier) -> int | None:
+    """The early-stopping iteration, when early stopping was active."""
+    value = getattr(classifier.model, "best_iteration", None)
+    return int(value) if value is not None else None
+
+
 def run_headline(
     manager: DatasetManager,
     config: DeltxConfig,
     features: pd.DataFrame,
     tune: bool,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Train with tuning + early stopping and evaluate on a stratified hold-out."""
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Train with tuning + early stopping and evaluate on a stratified hold-out.
+
+    Returns:
+        ``(train_result, metrics, shap_importance, extras)``, where ``extras``
+        carries the split sizes and early-stopping iteration for the run manifest.
+    """
     train_df, test_df = manager.prepare_train_test_split(
         features, test_size=TEST_FRACTION, stratify_by="label"
     )
@@ -175,7 +222,13 @@ def run_headline(
     )
     metrics = classifier.evaluate(x_test, y_test)
     shap_importance = classifier.compute_shap_importance(x_test)
-    return train_result, metrics, shap_importance
+    extras = {
+        "split": SplitSizes(
+            train=len(train_core), validation=len(val_df), test=len(test_df)
+        ),
+        "early_stopped_iteration": _best_iteration(classifier),
+    }
+    return train_result, metrics, shap_importance, extras
 
 
 def run_lomo(
@@ -189,7 +242,8 @@ def run_lomo(
 
     Returns:
         A dict with the unseen-generator detection recall, the held-out sample
-        count, and the full mixed-test metrics for context.
+        count, this model's own tuned parameters, and the full mixed-test metrics
+        for context.
     """
     lomo_train, lomo_test = manager.prepare_train_test_split(
         features, test_size=TEST_FRACTION, holdout_model=holdout_model
@@ -197,7 +251,7 @@ def run_lomo(
     x_train, y_train = to_xy(lomo_train)
 
     classifier = DetectionClassifier(config)
-    classifier.train(x_train, y_train, tune_hyperparameters=tune)
+    train_result = classifier.train(x_train, y_train, tune_hyperparameters=tune)
 
     # Isolate the held-out generator's rows (all AI) for the clean OOD signal.
     models = lomo_test["ai_model"].fillna("").astype(str).str.strip().str.lower()
@@ -215,6 +269,8 @@ def run_lomo(
         "unseen_samples": int(gen_mask.sum()),
         "unseen_recall": unseen_recall,
         "mixed_metrics": mixed_metrics,
+        "best_params": train_result["best_params"],
+        "cv_scores": train_result["cv_scores"],
     }
 
 
@@ -227,6 +283,79 @@ def ship(
     result = classifier.train(x_all, y_all, tune_hyperparameters=tune)
     saved_to = classifier.save()  # defaults to config.classifier_path
     return saved_to, result
+
+
+def build_manifest(
+    args: argparse.Namespace,
+    config: DeltxConfig,
+    started_at: str,
+    duration_seconds: float,
+    available: pd.DataFrame,
+    used: pd.DataFrame,
+    train_result: dict[str, Any],
+    metrics: dict[str, Any],
+    shap_importance: dict[str, Any],
+    headline_extras: dict[str, Any],
+    lomo: dict[str, Any] | None,
+    shipped: tuple[Path, dict[str, Any]] | None,
+) -> tuple[RunManifest, str | None]:
+    """Assemble the citable record of this run.
+
+    Returns:
+        The manifest, and the uncommitted git diff (``None`` when the tree is
+        clean) for writing alongside it.
+    """
+    provenance, diff = build_provenance(
+        config,
+        REPO_ROOT,
+        timestamp_utc=started_at,
+        duration_seconds=duration_seconds,
+        argv=sys.argv[1:],
+    )
+
+    headline = Evaluation(
+        split=headline_extras.get("split"),
+        best_params=train_result.get("best_params", {}),
+        cv_scores=train_result.get("cv_scores", {}),
+        early_stopped_iteration=headline_extras.get("early_stopped_iteration"),
+        training_time_seconds=train_result.get("training_time_seconds"),
+        metrics=metrics,
+        shap_mean_abs=shap_importance.get("mean_abs_shap"),
+    )
+
+    lomo_block = (
+        LeaveOneModelOut(
+            holdout_model=lomo["holdout_model"],
+            unseen_samples=lomo["unseen_samples"],
+            unseen_recall=lomo["unseen_recall"],
+            best_params=lomo.get("best_params", {}),
+            cv_scores=lomo.get("cv_scores", {}),
+            mixed_metrics=lomo.get("mixed_metrics", {}),
+        )
+        if lomo is not None
+        else None
+    )
+
+    shipped_block = None
+    if shipped is not None:
+        saved_to, ship_result = shipped
+        shipped_block = ShippedArtifact(
+            path=str(saved_to),
+            sha256=sha256_file(saved_to),
+            trained_on_rows=len(used),
+            best_params=ship_result.get("best_params", {}),
+            cv_scores=ship_result.get("cv_scores", {}),
+        )
+
+    manifest = RunManifest(
+        run_id=make_run_id(args.tag or args.holdout_model),
+        provenance=provenance,
+        dataset=fingerprint_dataset(args.features, available, used),
+        headline=headline,
+        lomo=lomo_block,
+        shipped=shipped_block,
+    )
+    return manifest, diff
 
 
 def render_report(
@@ -293,18 +422,27 @@ def render_report(
 
 def main(argv: list[str] | None = None) -> int:
     """Run the full train/evaluate/ship workflow. Returns a process exit code."""
-    logging.basicConfig(level=logging.INFO)
+    # Route logging through the recording console so the captured report holds the
+    # same interleaved log lines and tables the operator saw.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(console=console, rich_tracebacks=True)],
+    )
     args = parse_args(argv)
     config = DeltxConfig()
     tune = not args.no_tune
+    started_at = utc_now_iso()
+    started = time.perf_counter()
     console.rule("[bold]Phase C — train, evaluate, and ship the detector")
 
     try:
         manager = DatasetManager(config)
-        features = load_features(args.features)
-        features = rebalance(features, args.per_class, config.random_seed)
+        available = load_features(args.features)
+        features = rebalance(available, args.per_class, config.random_seed)
 
-        train_result, metrics, shap_importance = run_headline(
+        train_result, metrics, shap_importance, headline_extras = run_headline(
             manager, config, features, tune
         )
 
@@ -312,13 +450,45 @@ def main(argv: list[str] | None = None) -> int:
         if args.holdout_model is not None:
             lomo = run_lomo(manager, config, features, args.holdout_model, tune)
 
-        saved_to, _ = ship(config, features, tune)
+        saved_to, ship_result = ship(config, features, tune)
     except DeltxError as exc:
         console.print(f"[red]Training failed:[/red] {exc}")
         return 1
 
     render_report(train_result, metrics, shap_importance, lomo)
     console.print(f"[bold green]Production model saved →[/bold green] {saved_to}")
+
+    if args.no_capture:
+        console.print(
+            "[yellow]Run capture disabled (--no-capture); these results are "
+            "not reproducible.[/yellow]"
+        )
+        return 0
+
+    try:
+        manifest, diff = build_manifest(
+            args,
+            config,
+            started_at,
+            time.perf_counter() - started,
+            available,
+            features,
+            train_result,
+            metrics,
+            shap_importance,
+            headline_extras,
+            lomo,
+            (saved_to, ship_result),
+        )
+        # export_text() must run last: it drains everything printed above.
+        run_dir = write_run(args.run_dir, manifest, console.export_text(), diff)
+    except (ProvenanceError, DeltxError) as exc:
+        # The model shipped and the report printed, but an uncapturable run cannot
+        # be cited later — surface that as a failure rather than a silent success.
+        console.print(f"[red]Run capture failed:[/red] {exc}")
+        return 1
+
+    console.print(f"[bold green]Run captured →[/bold green] {run_dir}")
     console.print(
         "[dim]Verify with: poetry run deltx-detect analyze --file <some.py>[/dim]"
     )

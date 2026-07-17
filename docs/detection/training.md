@@ -129,12 +129,68 @@ poetry run python scripts/train_detector.py --no-tune
 | `--holdout-model` | — | Generator (`ai_model` value) held out for the LOMO test; omit to skip LOMO |
 | `--per-class` | min class | Rebalance to exactly this many rows per class |
 | `--no-tune` | off | Skip the hyperparameter search (default params, much faster) |
+| `--run-dir` | `data/runs` | Where the run manifest, report, and index are written |
+| `--tag` | `--holdout-model`'s value | Short label appended to the run id |
+| `--no-capture` | off | Skip the manifest (results become unreproducible) |
 
 Verify the shipped model end to end:
 
 ```bash
 poetry run deltx-detect analyze --file some_module.py   # → ai_confidence_pct in [0, 100]
 ```
+
+## Run capture — making results citable
+
+Every run writes a record to `--run-dir` (default `data/runs/`). A console
+scrollback is not a record: it does not survive a terminal, and it cannot tell you
+months later *which* data or *which* code produced a number.
+
+```
+data/runs/
+├── index.jsonl                          # one flat row per run
+└── 2026-07-17T18-42-11Z_gemini/
+    ├── manifest.json                    # the full record
+    ├── report.txt                       # console output, verbatim
+    └── uncommitted.diff                 # only when the tree was dirty
+```
+
+`data/runs/` is **not** gitignored (unlike `raw`/`processed`/`models`), and that is
+deliberate — manifests are a few KB, and committing them makes git the lab
+notebook.
+
+`manifest.json` holds four blocks. Three fields in it are easy to dismiss and are
+the whole point:
+
+- **`dataset.sha256`** pins the feature matrix's *bytes*. A stable path is not a
+  stable input; rebuilding or repairing the parquet silently invalidates every
+  number previously attributed to it.
+- **`provenance.git.dirty`** plus the sibling `uncommitted.diff` records work in
+  progress. Citing a commit hash for a run that executed against modified files is
+  false, and development runs are dirty far more often than not. Untracked files
+  appear in `dirty_files` but *not* in the diff — `git diff HEAD` cannot see them.
+- **`provenance.packages`** pins xgboost/sklearn/shap/numpy. They change defaults
+  across releases, so identical code and data can still drift apart over time.
+
+The fourth block, `shipped`, records the artifact's **own** hyperparameters and
+hash — which routinely differ from `headline`'s, because `ship()` re-runs the
+search over the full dataset. The `.joblib` is not the model whose metrics you
+publish, and only the manifest records both.
+
+Compare every experiment you have ever run in two lines:
+
+```python
+from deltx.common.provenance import load_index
+load_index(Path("data/runs"))[["run_id", "holdout_model", "headline_f1", "unseen_recall"]]
+```
+
+If capture fails, the script exits non-zero even though the model shipped: a run
+you cannot cite is a failed run for research purposes, and you want to know
+immediately rather than at write-up.
+
+> **Windows note.** Redirecting output (`> run.log`) can raise `UnicodeEncodeError`
+> on the report's arrows and box glyphs, because Python falls back to cp1252 when
+> stdout is not a terminal. Set `PYTHONIOENCODING=utf-8`, or simply don't redirect
+> — `report.txt` already captures the console verbatim, in UTF-8.
 
 ## Tweaks and tuning knobs
 

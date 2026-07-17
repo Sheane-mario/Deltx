@@ -23,3 +23,7 @@ class DatasetError(DeltxError):
 
 class ClassifierError(DeltxError):
     """Classifier training, evaluation, or persistence failure."""
+
+
+class ProvenanceError(DeltxError):
+    """Run manifest capture or persistence failure."""
