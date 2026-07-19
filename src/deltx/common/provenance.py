@@ -142,6 +142,27 @@ class LeaveOneModelOut(BaseModel):
     mixed_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
+class DomainTransfer(BaseModel):
+    """A train-on-one-corpus, score-on-a-disjoint-corpus evaluation.
+
+    Distinct from :class:`LeaveOneModelOut`: LOMO withholds one *generator* while
+    the corpus stays fixed, so it measures novelty of the model that wrote the
+    code. This withholds the whole *corpus*, measuring whether the detector
+    survives a change of provenance. Recorded separately because the headline
+    metrics of a transfer run describe a different population and must never be
+    compared against stratified in-distribution runs.
+    """
+
+    train_sources: list[str] = Field(default_factory=list)
+    eval_sources: list[str] = Field(default_factory=list)
+    train_rows: int
+    eval_rows: int
+    eval_class_balance: dict[str, int] = Field(default_factory=dict)
+    eval_generator_counts: dict[str, int] = Field(default_factory=dict)
+    ai_recall: float
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
 class ShippedArtifact(BaseModel):
     """The model actually written to disk.
 
@@ -165,6 +186,7 @@ class RunManifest(BaseModel):
     dataset: DatasetFingerprint
     headline: Evaluation
     lomo: LeaveOneModelOut | None = None
+    transfer: DomainTransfer | None = None
     shipped: ShippedArtifact | None = None
 
 
@@ -384,6 +406,7 @@ def index_row(manifest: RunManifest, run_dir: Path) -> dict[str, Any]:
     loads with ``pd.read_json(path, lines=True)`` and compares in one table.
     """
     metrics = manifest.headline.metrics
+    transfer = manifest.transfer
     return {
         "run_id": manifest.run_id,
         "timestamp_utc": manifest.provenance.timestamp_utc,
@@ -396,6 +419,10 @@ def index_row(manifest: RunManifest, run_dir: Path) -> dict[str, Any]:
         "headline_f1": metrics.get("f1_score"),
         "headline_auroc": metrics.get("auroc"),
         "unseen_recall": manifest.lomo.unseen_recall if manifest.lomo else None,
+        # Flags the headline above as measured on a *different* population, so a
+        # reader tabling the index cannot silently compare it against the rest.
+        "eval_sources": ",".join(transfer.eval_sources) if transfer else None,
+        "transfer_ai_recall": transfer.ai_recall if transfer else None,
         "run_dir": str(run_dir),
     }
 
