@@ -104,6 +104,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Generator (ai_model value) to hold out for the LOMO test.",
     )
     parser.add_argument(
+        "--sources",
+        nargs="+",
+        default=None,
+        metavar="SOURCE",
+        help=(
+            "Restrict to these source_dataset values, e.g. "
+            "'aigcodeset droidcollection' to drop CodeNet (default: all present)."
+        ),
+    )
+    parser.add_argument(
+        "--drop-features",
+        nargs="+",
+        default=None,
+        metavar="FEATURE",
+        help=(
+            "Ablation: exclude these feature columns from training. Implies "
+            "--no-ship, since the production model must keep all 16 features."
+        ),
+    )
+    parser.add_argument(
         "--per-class",
         type=int,
         default=None,
@@ -151,6 +171,77 @@ def load_features(path: Path) -> pd.DataFrame:
     return frame
 
 
+def select_sources(frame: pd.DataFrame, sources: list[str] | None) -> pd.DataFrame:
+    """Restrict the frame to the named ``source_dataset`` values.
+
+    Dropping a source is purely subtractive: the surviving rows already carry
+    extracted features, so no Phase B re-run is needed to change the source mix.
+
+    Raises:
+        DeltxError: If the column is absent, a name matches nothing, or the
+            filter leaves no rows.
+    """
+    if sources is None:
+        return frame
+    if "source_dataset" not in frame.columns:
+        raise DeltxError("--sources needs a 'source_dataset' column; none present.")
+
+    present = set(frame["source_dataset"].unique())
+    # A typo would otherwise silently shrink the corpus and quietly invalidate the
+    # comparison against other runs, so name the bad value rather than filter on it.
+    unknown = [name for name in sources if name not in present]
+    if unknown:
+        raise DeltxError(f"Unknown source(s) {unknown}; available: {sorted(present)}")
+
+    selected = frame[frame["source_dataset"].isin(sources)].reset_index(drop=True)
+    dropped = sorted(present - set(sources))
+    console.print(
+        f"Sources: kept [bold]{', '.join(sorted(sources))}[/bold] "
+        f"({len(selected)} of {len(frame)} rows)"
+        + (f", dropped {', '.join(dropped)}" if dropped else "")
+    )
+    return selected
+
+
+def resolve_feature_columns(drop: list[str] | None) -> list[str]:
+    """The feature columns to train on, minus any ablated ones.
+
+    Raises:
+        DeltxError: If a named feature is not a real column, or all are dropped.
+    """
+    if not drop:
+        return list(FEATURE_COLUMNS)
+
+    unknown = [name for name in drop if name not in FEATURE_COLUMNS]
+    if unknown:
+        raise DeltxError(
+            f"Unknown feature(s) {unknown}; available: {list(FEATURE_COLUMNS)}"
+        )
+
+    kept = [name for name in FEATURE_COLUMNS if name not in drop]
+    if not kept:
+        raise DeltxError("--drop-features removed every feature; nothing to train on.")
+    console.print(
+        f"Ablation: dropped [bold]{', '.join(drop)}[/bold] "
+        f"({len(kept)} of {len(FEATURE_COLUMNS)} features remain)"
+    )
+    return kept
+
+
+def make_classifier(
+    config: DeltxConfig, feature_columns: list[str]
+) -> DetectionClassifier:
+    """A classifier whose feature names match the columns actually trained on.
+
+    ``DetectionClassifier`` defaults ``feature_names`` to all 16 canonical
+    features; under ablation that would misalign the SHAP labels against a
+    narrower matrix (and trip the ``strict=True`` zip in ``compute_shap_importance``).
+    """
+    classifier = DetectionClassifier(config)
+    classifier.feature_names = list(feature_columns)
+    return classifier
+
+
 def rebalance(frame: pd.DataFrame, per_class: int | None, seed: int) -> pd.DataFrame:
     """Downsample to an exact, equal per-class count (rejects may have skewed it)."""
     counts = frame["label"].value_counts()
@@ -172,9 +263,12 @@ def rebalance(frame: pd.DataFrame, per_class: int | None, seed: int) -> pd.DataF
     return balanced
 
 
-def to_xy(frame: pd.DataFrame) -> tuple[FloatArray, IntArray]:
+def to_xy(
+    frame: pd.DataFrame, feature_columns: list[str] | None = None
+) -> tuple[FloatArray, IntArray]:
     """Extract the (features, labels) numpy arrays from a frame."""
-    x = frame.loc[:, FEATURE_COLUMNS].to_numpy(dtype=np.float64)
+    columns = FEATURE_COLUMNS if feature_columns is None else feature_columns
+    x = frame.loc[:, columns].to_numpy(dtype=np.float64)
     y = frame["label"].to_numpy(dtype=np.int_)
     return x, y
 
@@ -190,6 +284,7 @@ def run_headline(
     config: DeltxConfig,
     features: pd.DataFrame,
     tune: bool,
+    feature_columns: list[str],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Train with tuning + early stopping and evaluate on a stratified hold-out.
 
@@ -212,11 +307,11 @@ def run_headline(
         f"[bold]{len(val_df)}[/bold] val / [bold]{len(test_df)}[/bold] test"
     )
 
-    x_train, y_train = to_xy(train_core)
-    x_val, y_val = to_xy(val_df)
-    x_test, y_test = to_xy(test_df)
+    x_train, y_train = to_xy(train_core, feature_columns)
+    x_val, y_val = to_xy(val_df, feature_columns)
+    x_test, y_test = to_xy(test_df, feature_columns)
 
-    classifier = DetectionClassifier(config)
+    classifier = make_classifier(config, feature_columns)
     train_result = classifier.train(
         x_train, y_train, x_val, y_val, tune_hyperparameters=tune
     )
@@ -237,6 +332,7 @@ def run_lomo(
     features: pd.DataFrame,
     holdout_model: str,
     tune: bool,
+    feature_columns: list[str],
 ) -> dict[str, Any]:
     """Train without one generator, then score on that unseen generator only.
 
@@ -248,21 +344,21 @@ def run_lomo(
     lomo_train, lomo_test = manager.prepare_train_test_split(
         features, test_size=TEST_FRACTION, holdout_model=holdout_model
     )
-    x_train, y_train = to_xy(lomo_train)
+    x_train, y_train = to_xy(lomo_train, feature_columns)
 
-    classifier = DetectionClassifier(config)
+    classifier = make_classifier(config, feature_columns)
     train_result = classifier.train(x_train, y_train, tune_hyperparameters=tune)
 
     # Isolate the held-out generator's rows (all AI) for the clean OOD signal.
     models = lomo_test["ai_model"].fillna("").astype(str).str.strip().str.lower()
     gen_mask = models == holdout_model.strip().lower()
-    x_gen, _ = to_xy(lomo_test[gen_mask])
+    x_gen, _ = to_xy(lomo_test[gen_mask], feature_columns)
     gen_preds = classifier.predict(x_gen)
     unseen_recall = (
         float((gen_preds == AI_LABEL).mean()) if len(x_gen) else float("nan")
     )
 
-    x_test, y_test = to_xy(lomo_test)
+    x_test, y_test = to_xy(lomo_test, feature_columns)
     mixed_metrics = classifier.evaluate(x_test, y_test)
     return {
         "holdout_model": holdout_model,
@@ -440,23 +536,39 @@ def main(argv: list[str] | None = None) -> int:
     try:
         manager = DatasetManager(config)
         available = load_features(args.features)
-        features = rebalance(available, args.per_class, config.random_seed)
+        feature_columns = resolve_feature_columns(args.drop_features)
+        features = rebalance(
+            select_sources(available, args.sources), args.per_class, config.random_seed
+        )
 
         train_result, metrics, shap_importance, headline_extras = run_headline(
-            manager, config, features, tune
+            manager, config, features, tune, feature_columns
         )
 
         lomo: dict[str, Any] | None = None
         if args.holdout_model is not None:
-            lomo = run_lomo(manager, config, features, args.holdout_model, tune)
+            lomo = run_lomo(
+                manager, config, features, args.holdout_model, tune, feature_columns
+            )
 
-        saved_to, ship_result = ship(config, features, tune)
+        # An ablated model cannot serve inference: the pipeline always builds a
+        # 16-D vector, so shipping one would break deltx-detect at load time.
+        # Ablations are diagnostic, so leave the production artifact untouched.
+        shipped: tuple[Path, dict[str, Any]] | None = None
+        if args.drop_features:
+            console.print(
+                "[yellow]Ablation run — production model not shipped; "
+                f"{config.classifier_path} left as-is.[/yellow]"
+            )
+        else:
+            shipped = ship(config, features, tune)
     except DeltxError as exc:
         console.print(f"[red]Training failed:[/red] {exc}")
         return 1
 
     render_report(train_result, metrics, shap_importance, lomo)
-    console.print(f"[bold green]Production model saved →[/bold green] {saved_to}")
+    if shipped is not None:
+        console.print(f"[bold green]Production model saved →[/bold green] {shipped[0]}")
 
     if args.no_capture:
         console.print(
@@ -478,7 +590,7 @@ def main(argv: list[str] | None = None) -> int:
             shap_importance,
             headline_extras,
             lomo,
-            (saved_to, ship_result),
+            shipped,
         )
         # export_text() must run last: it drains everything printed above.
         run_dir = write_run(args.run_dir, manifest, console.export_text(), diff)
