@@ -67,7 +67,7 @@ Surprisal definition: `S(tᵢ) = −log₂ P(tᵢ | t₁, t₂, …, tᵢ₋₁)
 | F7  | Stylometric   | Avg Identifier Length   | Mean character length of variable/function/class names         |
 | F8  | Stylometric   | Identifier Diversity    | Unique identifiers / total identifier count                    |
 | F9  | Stylometric   | Whitespace Consistency  | Std deviation of indentation levels across lines               |
-| F10 | Stylometric   | Comment-to-Code Ratio   | Comment lines / total lines                                    |
+| F10 | Stylometric   | Comment-to-Code Ratio   | Comment lines / lines of code; **unbounded** (LOC excludes comment-only lines) |
 | F11 | Stylometric   | AST Depth (Mean)        | Average nesting depth of AST nodes                             |
 | F12 | Stylometric   | AST Node-Type Diversity | Shannon entropy of AST node-type frequency distribution        |
 | F13 | Distribution  | Shannon Entropy         | `H = −∑ p(t) log₂ p(t)` over the token distribution            |
@@ -78,6 +78,17 @@ Surprisal definition: `S(tᵢ) = −log₂ P(tᵢ | t₁, t₂, …, tᵢ₋₁)
 Field names on `FeatureVector` follow the pattern `f1_mean_surprisal` …
 `f16_hapax_legomena_ratio`; `FeatureVector.feature_names()` returns them in
 F1–F16 order and is the single source of truth for column ordering.
+
+> **F10 is a ratio to *code*, not to total lines, and is therefore unbounded.**
+> `lines_of_code` counts non-empty, non-comment-only lines (`parser.py`), so a
+> heavily-commented file can exceed 1.0 — on the 94k-row droid-only feature
+> matrix, 0.45% of rows do, with a maximum of 108. This is the intended
+> definition (it is comment *density* over code, which is what the feature name
+> says), not a defect. It is safe for the tree ensemble, which splits on
+> thresholds and is scale-invariant, but any future model that assumes bounded
+> or normally-distributed inputs must scale this feature. Files with zero lines
+> of code short-circuit to an all-zero stylometric vector, so the division is
+> guarded.
 
 ## Usage Examples
 

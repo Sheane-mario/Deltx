@@ -90,7 +90,7 @@ Surprisal definition: `S(tᵢ) = −log₂ P(tᵢ | t₁, t₂, …, tᵢ₋₁)
 | F7  | Avg Identifier Length   | Mean character length of variable/function/class names  |
 | F8  | Identifier Diversity    | Unique identifiers / total identifier count             |
 | F9  | Whitespace Consistency  | Std deviation of indentation levels across lines        |
-| F10 | Comment-to-Code Ratio   | Comment lines / total lines                             |
+| F10 | Comment-to-Code Ratio   | Comment lines / lines of code (LOC excludes comments)    |
 | F11 | AST Depth (Mean)        | Average nesting depth of AST nodes                      |
 | F12 | AST Node-Type Diversity | Shannon entropy of AST node type frequency distribution |
 

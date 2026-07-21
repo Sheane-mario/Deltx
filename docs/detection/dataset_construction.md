@@ -1,179 +1,286 @@
 # Constructing the Deltx AI-Authorship Training Corpus
 
 This document describes the procedure by which the Stage-2 (AI Authorship
-Detection) training corpus is assembled: a **balanced 22,000-row dataset of
-Python source files** (11,000 human-written, 11,000 AI-generated). It covers the
-source corpora and their raw sizes, the sampling caps, the filtering and
-deduplication pipeline, the observed conflict/duplicate counts, the resulting
-class balance, and an analysis of how far the corpus size can be pushed.
+Detection) training corpus is assembled: the source corpora, the sampling caps,
+the filtering and deduplication pipeline, the observed conflict/duplicate counts,
+the resulting class balance, and the losses incurred during feature extraction.
 
-Every figure below is taken directly from the reference build produced by
-`scripts/build_training_set.py` with its default parameters
-(`random_seed = 42`), not from estimates. Feature extraction and classifier
-training are deliberately out of scope — they are documented separately.
+Every figure below is measured from the actual build artifacts, not estimated.
+
+> **Two builds are documented here.** §2–§6 describe the **current** reference
+> build — **DroidCollection only, 100,000 rows**. §8 preserves the **superseded**
+> three-source build (22,000 rows), because the ten runs recorded in
+> `data/runs/index.jsonl` were all produced against it and remain citable only if
+> its construction stays on record.
 
 ## 1. Design goals
 
-The corpus is built to satisfy three constraints simultaneously:
+The corpus is built to satisfy four constraints:
 
 1. **Python only.** Deltx targets Python repositories exclusively, so every
    non-Python sample is discarded regardless of source.
-2. **Class balance.** The downstream classifier is trained without any
+2. **Single corpus.** All samples come from one source corpus. Pooling corpora
+   lets the classifier separate *corpora* instead of *authorship* — see §1.1.
+3. **Class balance.** The downstream classifier is trained without any
    class-imbalance weighting, so the corpus is downsampled to an exact **50/50**
    human/AI ratio before any feature extraction is spent on it.
-3. **Provenance integrity.** Because the source corpora overlap and occasionally
-   contradict one another, the pipeline removes cross-source duplicates and
-   label-conflicting samples *before* balancing, so no sample's ground-truth
-   label is decided by chance.
+4. **Provenance integrity.** Label-conflicting samples are removed before
+   balancing, so no sample's ground-truth label is decided by chance.
 
 The unified representation used throughout is a five-column schema:
 `source_code`, `label` (0 = human, 1 = AI), `source_dataset`, `ai_model`
 (the generating model for AI rows, `None` for human rows), and `language`.
 
-## 2. Source corpora and raw sizes
+### 1.1 Why a single corpus
 
-Three publicly available corpora are used. Each is downloaded once and cached.
+Constraint 2 replaced the earlier multi-source design, and it was an empirical
+decision rather than a stylistic one. Three measurements drove it:
 
-| Source | Origin | Native format | Raw Python content used |
-|---|---|---|---|
-| **AIGCodeSet** | HuggingFace `basakdemirok/AIGCodeSet` | 2 CSV files | 7,583 samples (4,755 human + 2,828 AI) |
-| **CodeNet** | IBM Project CodeNet, `Python800` subset | 240,000 `.py` files | 240,000 samples (all human) |
-| **DroidCollection** | HuggingFace `project-droid/DroidCollection` | 5 parquet shards | 246,407 samples (after label mapping; see §2.3) |
+**Feature importance tracked corpus identity, not authorship.**
+`f7_avg_identifier_length` was the top-ranked feature by mean |SHAP| in the
+pooled build (**0.925**), and collapsed to rank 6 (**0.186**) the moment CodeNet
+was removed — while the features that replaced it at the top barely moved.
+CodeNet is competitive-programming code, where identifiers are `n`, `i`, `dp`.
+The pooled model had learned *"short identifiers ⇒ human"*, which is true of
+CodeNet specifically and not of human code generally.
 
-Combined raw supply entering the pipeline: **≈ 493,990 Python samples**.
+**Generalization to unseen generators improved when the shortcut was removed.**
+Leave-one-model-out recall on the held-out `gemini` generator was **0.179**
+pooled, and **0.547** with CodeNet dropped. The pooled detector was substantially
+blind to an unseen LLM because a corpus shortcut was available instead.
 
-### 2.1 AIGCodeSet
+**Cross-corpus transfer is near chance.** Training on DroidCollection and testing
+on AIGCodeSet gives AUROC **0.581**; the reverse gives **0.591**
+(`transfer-droid-to-aig`, `transfer-aig-to-droid`). Whatever a pooled model
+learns does not survive a corpus change, so pooling buys apparent diversity
+without buying transferable signal.
 
-A small, supplementary corpus supplying **7,583** Python samples: **4,755
-human** and **2,828 AI**. The AI half was generated by CodeLlama 34B, Codestral
-22B, and Gemini 1.5 Flash; the human half is drawn from CodeNet. Two CSV files
-are read (`human_selected_dataset.csv`, `created_dataset_with_llms.csv`); a
-third combined CSV carrying embeddings (265 MB) is deliberately skipped as it is
-not needed. AIGCodeSet is listed **first** in the source order, which matters for
-deduplication (§4.4).
+DroidCollection is the chosen corpus because it is the only source carrying both
+classes in volume from a shared distribution, and it spans 45 generators, so
+generator diversity is preserved without pooling.
 
-### 2.2 CodeNet (`Python800`)
+See [ablation.md](ablation.md) for the feature-family analysis that runs on this
+corpus and the reasoning behind its single-corpus design.
 
-A human-only ground-truth corpus. The full IBM Project CodeNet archive is 7.8 GB
-across 55 languages and ~14M submissions; Deltx downloads only the **`Python800`
-benchmark subset** — a ~30 MB tarball of **240,000** Python files organised as
-**800 programming problems × 300 accepted submissions each**. Every file is
-human-written, so all 240,000 rows carry `label = 0`. This is the pipeline's
-reservoir of human samples.
+## 2. Source corpus and label policy
 
-### 2.3 DroidCollection
+**DroidCollection** (`project-droid/DroidCollection`, EMNLP 2025) — parquet
+shards under `data/`, ~1.06M rows across 9 languages. Filtering to Python yields
+**328,383** rows.
 
-The largest and most diverse source: ~1.06M rows across 9 languages, of which
-roughly 262k are Python. Its `Label` column is **four-class**, and only two of
-those classes are admitted:
+Its `Label` column is four-class, and only two map cleanly onto the
+`label ∈ {0, 1}` contract:
 
-| DroidCollection label | Policy | Reason |
-|---|---|---|
-| `HUMAN_GENERATED` | → `label = 0` | Clean human |
-| `MACHINE_GENERATED` | → `label = 1` | Clean AI |
-| `MACHINE_REFINED` | **dropped** | Human code an LLM rewrote — mixed authorship |
-| `MACHINE_GENERATED_ADVERSARIAL` | **dropped** | AI styled to read as human — would poison class 0 |
+| DroidCollection label | Rows (Python) | Share | Policy |
+|---|---:|---:|---|
+| `HUMAN_GENERATED` | 148,211 | 45.1% | → `label = 0` |
+| `MACHINE_GENERATED` | 98,196 | 29.9% | → `label = 1` |
+| `MACHINE_REFINED` | 46,379 | 14.1% | **dropped** — human code an LLM rewrote; mixed authorship |
+| `MACHINE_GENERATED_ADVERSARIAL` | 35,597 | 10.8% | **dropped** — AI styled to read as human; would poison class 0 |
+| **Total** | **328,383** | 100% | |
 
-Applying this policy discarded **81,976** Python rows whose label fell outside
-the two admitted classes, leaving **246,407** usable Python samples: **148,211
-human (60.1%)** and **98,196 AI (39.9%)**. The `Generator` column, recording
-which of 45 distinct models produced each AI row, is preserved as `ai_model`.
+Admitting the adversarial rows in particular would teach the classifier that
+human style *is* AI style, which is the one lesson it must not learn.
 
-## 3. Sampling caps
+Applying the policy discards **81,976 rows (25.0%)** and leaves **246,407**
+usable Python samples: **148,211 human (60.1%) / 98,196 AI (39.9%)**. The policy
+lives in `DatasetManager.DROID_LABEL_MAP`; override the class attribute to change
+it.
 
-Two caps govern the size and cost of the corpus. Both are command-line
-parameters with the defaults used in the reference build:
+The `Generator` column, recording which of 45 distinct models produced each AI
+row, is preserved (lower-cased) as `ai_model` and powers the leave-one-model-out
+test in Phase C.
 
-| Parameter | Default | Role |
-|---|---|---|
-| `--max-per-source` | **40,000** | Per-source ceiling applied at load time, *before* filtering. Bounds memory against DroidCollection's ~246k rows and prevents any single corpus from dominating. |
-| `--per-class` | **11,000** | Target rows per class after balancing. Over-provisioned above the ~10k/class final target so the corpus survives the samples Phase B later rejects. |
+## 3. Sampling caps — and how they interact
 
-The per-source cap is applied by **random subsampling** (seeded, `seed = 42`):
+| Parameter | Value used | Role |
+|---|---:|---|
+| `--max-per-source` | **250,000** | Per-source ceiling applied at load time. Effectively uncapped for this build. |
+| `--per-class` | **50,000** | Target rows per class after balancing. |
 
-- DroidCollection: 246,407 → **40,000** rows sampled
-- CodeNet: 240,000 → **40,000** rows sampled
-- AIGCodeSet: 7,583 rows — **below the cap, taken in full**
+```bash
+poetry run python scripts/build_training_set.py \
+  --sources droidcollection \
+  --per-class 50000 \
+  --max-per-source 250000 \
+  --output data/processed/train_droid_50k.parquet
+```
 
-This yields **87,583** raw samples entering the filter pipeline (40,000 +
-40,000 + 7,583).
+> **The two flags are coupled, and the coupling is easy to miss.** The label map
+> is applied **at load** (`dataset.py:634`), *before* `max_per_source` samples
+> (`dataset.py:788`). The cap therefore draws from the 246,407 post-policy rows
+> at DroidCollection's natural **60.1 / 39.9** class ratio — so a cap of `C`
+> yields roughly `0.3985 × C` AI rows, and `balance()` clamps `--per-class` to
+> whatever the scarcer class supplies.
+>
+> A cap of 100,000 yields only ~39,500 AI rows and silently produces a
+> **39.5k/class** corpus against a 50k request. Reaching 50,000/class requires
+> `--max-per-source ≥ 126,503`; **≥ 137,000** to still clear 50k/class after
+> Phase B rejects (§6). `balance()` does print a warning when it clamps
+> (`build_training_set.py:155`), but only after the run.
+>
+> Setting the cap at or above 246,407 removes the coupling entirely. Its original
+> purpose — bounding memory — is not a concern for a single source: at a mean
+> 1,099 characters per sample, all 246,407 rows are ~0.27 GB of strings.
 
 ## 4. Filtering and deduplication pipeline
 
-The pooled samples pass through four filters **in a fixed order**. The order is
-load-bearing — in particular, conflict removal must precede deduplication, or
-the very rows that disagree would be silently collapsed.
+The samples pass through four filters **in a fixed order**. The order is
+load-bearing: conflict removal must precede deduplication, or the rows that
+disagree would be silently collapsed.
 
-### 4.1 Python-only filter
+| Step | Filter | Rows removed |
+|---|---|---:|
+| 4.1 | Python-only | 0 (already Python by construction) |
+| 4.2 | Minimum length (< 10 tokens) | **1,544** |
+| 4.3 | Label-conflict removal (all copies) | **0** |
+| 4.4 | Exact-duplicate `source_code` | **475** |
 
-Non-Python samples are removed. In the reference build every sample was already
-Python by construction, so **0** rows were removed here; the filter exists to
-guarantee the invariant when sources are configured differently.
+**Usable unique samples: 244,388** — **147,308 human / 97,080 AI**.
 
-### 4.2 Minimum-length filter
+Two of these numbers are much smaller than in the three-source build, and both
+for the same reason. **Label conflicts are zero**: that pathology was purely an
+AIGCodeSet↔CodeNet artifact (an LLM reproducing a human solution verbatim across
+two corpora that disagreed about it). **Deduplication removes only 475 rows**
+because the cross-source overlap that made it load-bearing — AIGCodeSet's human
+half being drawn from CodeNet — no longer exists.
 
-Samples with fewer than **10 tokens** (counted by a cheap lexical proxy) are
-dropped as too short to carry a usable authorship signal. This removed **19**
-samples.
-
-### 4.3 Label-conflict removal
-
-An identical `source_code` string that appears with **both** `label = 0` and
-`label = 1` is a **contradiction**, not a duplicate: the corpora disagree about
-who wrote it (an LLM reproduced a human solution verbatim). Keeping either copy
-would let file-read order assign ground truth, so **every** copy of such a string
-is discarded.
-
-Observed in the reference build: **210 rows across 105 distinct code strings**
-were labelled both human and AI and removed entirely.
-
-### 4.4 Exact-duplicate deduplication
-
-Remaining byte-identical `source_code` strings are collapsed to a single copy.
-Because AIGCodeSet's human half is itself drawn from CodeNet, cross-source
-overlap is expected here. The **source order** (AIGCodeSet → DroidCollection →
-CodeNet) decides which copy survives a collision; this is safe only because
-§4.3 has already removed every group that disagreed on its label, so every
-surviving collision is between rows of the *same* class.
-
-Observed: **119** exact-duplicate samples were removed.
-
-### 4.5 Result of filtering — the unified corpus
-
-After all four filters, the **unified (filtered) corpus** holds **87,235
-samples**:
-
-| | Count | Share |
-|---|---|---|
-| Human (`label = 0`) | 68,529 | 78.6% |
-| AI (`label = 1`) | 18,706 | 21.4% |
-| **Total** | **87,235** | 100% |
-
-By source: DroidCollection 39,986 · CodeNet 39,914 · AIGCodeSet 7,335.
-
-Note the corpus is **human-heavy (≈ 3.7 : 1)** at this stage — a direct
-consequence of CodeNet being human-only and DroidCollection skewing human. The
-AI class is therefore the binding constraint on the final balanced size.
+Both filters are retained regardless. They are cheap, and they are the guarantee
+that makes source order irrelevant to ground truth if a second source is ever
+reintroduced.
 
 ## 5. Balancing to 50/50
 
-The final step downsamples each class to an equal count. The target is
-`min(--per-class, n_human, n_ai) = min(11,000, 68,529, 18,706) = **11,000**`,
-sampled per class (seeded) and shuffled together.
-
-Because 18,706 AI samples are available and only 11,000 are needed, the AI class
-is **not** exhausted — the corpus is balanced comfortably rather than being
-forced down to the AI ceiling.
-
-### Final balanced corpus: 22,000 rows
+The balanced target is `min(--per-class, n_human, n_ai)`. With 97,080 AI rows
+available and 50,000 requested, the AI class is **not** exhausted:
 
 | Class | Rows | Share |
-|---|---|---|
-| Human (`label = 0`) | 11,000 | 50.0% |
-| AI (`label = 1`) | 11,000 | 50.0% |
-| **Total** | **22,000** | 100% |
+|---|---:|---:|
+| Human (`label = 0`) | 50,000 | 50.0% |
+| AI (`label = 1`) | 50,000 | 50.0% |
+| **Total** | **100,000** | 100% |
 
-**Composition by source and class:**
+Written to `data/processed/train_droid_50k.parquet`. The AI half spans **41
+distinct generator models**.
+
+**The ceiling for this corpus is 194,160 rows (97,080/class)**, set by AI supply.
+The build is cap-limited by choice, not supply-limited — see §7.
+
+## 6. Feature-extraction losses (Phase B)
+
+Extraction is not lossless: a row is rejected when the source fails to parse or a
+feature family fails. Of 100,000 rows, **94,108 were extracted and 5,892
+rejected (5.89%)**, leaving:
+
+| Class | Extracted | Rejected | Reject rate |
+|---|---:|---:|---:|
+| Human | 48,264 | 1,736 | **3.47%** |
+| AI | 45,844 | 4,156 | **8.31%** |
+| **Total** | **94,108** | **5,892** | **5.89%** |
+
+`data/processed/train_features_checkpoint_droid_50k.parquet` retains all 100,000
+rows with a `features_extracted` boolean, and is the only record of *which* rows
+failed. Keep it alongside the extracted matrix.
+
+### 6.1 Rejection is class-biased, and concentrated in base models
+
+**AI code is rejected 2.4× more often than human code.** The cause is not diffuse
+— it is concentrated in non-instruction-tuned generators:
+
+| Generator | Rows | Rejected | Rate |
+|---|---:|---:|---:|
+| `qwen/qwen2.5-coder-7b` (**base**) | 1,459 | 487 | **33.4%** |
+| `qwen/qwen2.5-coder-7b-instruct` | 2,014 | 58 | 2.9% |
+| `meta-llama/llama-3.1-8b-instruct` | 1,499 | 69 | 4.6% |
+| `qwen/qwen2.5-coder-1.5b-instruct` | 1,818 | 43 | 2.4% |
+| `gpt-4o-mini` | 14,937 | 25 | 0.2% |
+
+The base Qwen loses a third of its samples while its instruction-tuned sibling
+loses 3%. Base models emit raw completions that trail off mid-statement or carry
+prose alongside code, and neither parses.
+
+**This is a selection bias and should be stated as one.** The AI class that
+survives into training is the *parseable* subset of AI code. A claim of the form
+"the detector achieves recall R on AI code" is properly read as "on AI code that
+parses." Base-model output is under-represented in the trained corpus relative to
+its true share, which also thins the held-out slice when a base model is chosen
+as the LOMO target.
+
+The bias is inherent to a pipeline that requires a valid AST, not a defect in
+this build — the superseded three-source build lost ~7.0% of DroidCollection rows
+the same way. It is recorded here so it is not rediscovered downstream.
+
+### 6.2 What Phase C receives
+
+Phase C rebalances the extracted matrix to the scarcer class: **45,844 per class,
+91,688 rows**, discarding 2,420 surplus human rows.
+
+All 41 generators survive extraction, and **24 retain ≥ 500 samples** — the
+threshold at which a leave-one-model-out slice is meaningful. `gpt-4o-mini` is
+the natural default holdout at **14,912** surviving rows.
+
+## 7. Scaling headroom
+
+The 100,000-row corpus is cap-limited, not supply-limited. AI is the binding
+class:
+
+| | Available (post-filter) |
+|---|---:|
+| Human | 147,308 |
+| AI | **97,080** |
+| **Balanced ceiling** | **194,160** (97,080/class) |
+
+Raising `--per-class` toward 97,080 roughly doubles the corpus. Beyond that,
+more AI samples require a corpus other than DroidCollection — which reintroduces
+the pooling problem in §1.1 and would need the cross-corpus question settled
+first.
+
+**Cost scales linearly.** Every added sample is scored against the
+350M-parameter CodeGen model in Phase B. This build's 100,000 rows took roughly
+1.5–3 hours on a T4; the full ceiling would take proportionally longer.
+Extraction checkpoints every 500 rows and resumes, so long sessions are safe.
+
+> **Note the constraint flipped.** In the three-source build, CodeNet supplied
+> the human class and DroidCollection's human half was starved to 3,832 rows by
+> the 40,000 cap — making **human** the binding class at 3,700 rows after
+> extraction. In a DroidCollection-only build, human is 1.5× more abundant than
+> AI. Any intuition about corpus size carried over from the earlier build is
+> inverted.
+
+## 8. Superseded: the three-source build (22,000 rows)
+
+Retained for provenance. Every run in `data/runs/index.jsonl` predating the
+switch was trained on this corpus (`features_sha256`
+`f0dad5e1b9630ad3d2c64e18ed3f38734c9b1186fc90a8ce638137af365ef404`), and those
+numbers are interpretable only against this construction. **Do not use it for new
+work** — §1.1 explains why.
+
+**Sources and raw supply (≈ 493,990 Python samples):**
+
+| Source | Origin | Raw Python content |
+|---|---|---|
+| AIGCodeSet | HF `basakdemirok/AIGCodeSet` | 7,583 (4,755 human + 2,828 AI) |
+| CodeNet | IBM Project CodeNet, `Python800` | 240,000 (all human) |
+| DroidCollection | HF `project-droid/DroidCollection` | 246,407 (after label mapping) |
+
+AIGCodeSet's AI half was generated by CodeLlama 34B, Codestral 22B and Gemini 1.5
+Flash; its human half is drawn from CodeNet, which is why cross-source dedup
+mattered. AIGCodeSet was listed **first**, so it won deduplication collisions.
+CodeNet is the `Python800` benchmark subset: 800 problems × 300 accepted
+submissions.
+
+**Caps:** `--max-per-source 40,000`, `--per-class 11,000`. DroidCollection
+246,407 → 40,000; CodeNet 240,000 → 40,000; AIGCodeSet 7,583 taken in full.
+**87,583 samples entered the filter pipeline.**
+
+**Filter losses:** 19 too short · **210 label-conflict rows across 105 distinct
+strings** · 119 exact duplicates.
+
+**Unified filtered corpus: 87,235** — 68,529 human (78.6%) / 18,706 AI (21.4%);
+by source DroidCollection 39,986 · CodeNet 39,914 · AIGCodeSet 7,335. The corpus
+was human-heavy (≈ 3.7 : 1) because CodeNet is human-only.
+
+**Final balanced corpus: 22,000** (11,000/class), spanning 44 generators:
 
 | Source | Human | AI | Total |
 |---|---:|---:|---:|
@@ -182,71 +289,38 @@ forced down to the AI ceiling.
 | AIGCodeSet | 752 | 1,570 | 2,322 |
 | **Total** | **11,000** | **11,000** | **22,000** |
 
-The AI half spans **44 distinct generator models** (from `gpt-4o-mini` at 2,796
-rows down to single-model tails of ~11 rows), providing the generator diversity
-required for the downstream leave-one-model-out generalization test.
+After extraction: 20,756 rows (CodeNet 6,307 · DroidCollection 12,335 ·
+AIGCodeSet 2,114). The droid-only experiments run against this matrix used only
+its 12,335 DroidCollection rows, rebalanced to **3,700/class — 7,400 rows**.
 
-## 6. Reproducibility
+## 9. Reproducibility
 
-The entire procedure is deterministic under a single seed (`random_seed = 42`),
-which governs all three subsampling steps, the per-class balancing draw, and the
-final shuffle. Re-running `scripts/build_training_set.py` with default arguments
-reproduces the 22,000-row corpus exactly. The output is written to
-`data/processed/train_balanced.parquet` in the unified five-column schema.
+The procedure is deterministic under a single seed (`random_seed = 42`), which
+governs the per-source subsampling, the per-class balancing draw, and the final
+shuffle. Re-running `scripts/build_training_set.py` with the §3 arguments
+reproduces the 100,000-row corpus exactly.
 
-## 7. Can the corpus be larger? Scaling analysis
+Phase B is deterministic given the same model, device and sequence length, but
+`DELTX_DEVICE` and `DELTX_MAX_SEQUENCE_LENGTH` change the extracted values —
+pin them when reproducing a feature matrix. Phase C manifests record the
+matrix's `sha256`, which is the authoritative identifier for any published
+number; see [training.md](training.md#run-capture--making-results-citable).
 
-Yes — the 22,000-row corpus is **not** an upper bound; it is the product of the
-default `--per-class 11,000` cap, chosen to keep the (expensive) downstream
-feature-extraction cost modest. The true ceiling is set by **supply of the
-scarcer class**, which is AI.
-
-**Where AI samples come from.** CodeNet contributes zero AI samples (it is
-human-only), so the entire AI class is supplied by DroidCollection and
-AIGCodeSet:
-
-| Source | AI samples available (pre-cap) |
-|---|---:|
-| DroidCollection | 98,196 |
-| AIGCodeSet | 2,828 |
-| **Theoretical AI ceiling** | **≈ 101,000** |
-
-**The current build is cap-limited, not supply-limited.** The reference build
-saw only 18,706 AI samples because `--max-per-source 40,000` randomly discarded
-most of DroidCollection before balancing. Raising both caps unlocks the reserve:
-
-- Setting `--max-per-source` to ≥ ~250,000 (i.e. no effective cap on
-  DroidCollection) admits all ~98k of its AI rows.
-- The AI class would then supply on the order of **~100,000 samples** (minus a
-  few hundred lost to length/conflict/dedup filtering).
-- Human supply is never the constraint: CodeNet (240k) + DroidCollection human
-  (148k) + AIGCodeSet human alone exceed **388,000** samples.
-
-**Practical ceiling.** A balanced corpus could therefore be grown to roughly
-**~100,000 rows per class (~200,000 total)** using these three sources, bounded
-by DroidCollection's AI supply. Beyond that, more AI samples would require a new
-corpus.
-
-**Cost trade-off.** Corpus size and downstream cost scale linearly: every added
-sample must be scored against a 350M-parameter language model during feature
-extraction (Phase B), which dominates pipeline cost. The 22,000-row default is a
-deliberate balance between statistical power and extraction budget; the machinery
-supports scaling up to ~10× larger by lifting `--max-per-source` and
-`--per-class` together, at proportional compute cost.
-
-## 8. Summary of key figures
+## 10. Summary of key figures — current build
 
 | Quantity | Value |
 |---|---:|
-| Raw Python samples across all sources | ≈ 493,990 |
-| DroidCollection rows dropped by label policy | 81,976 |
-| Per-source cap (`--max-per-source`) | 40,000 |
-| Samples entering the filter pipeline | 87,583 |
-| Removed — too short (< 10 tokens) | 19 |
-| Removed — label conflicts (across 105 strings) | 210 |
-| Removed — exact duplicates | 119 |
-| Unified filtered corpus | 87,235 (68,529 human / 18,706 AI) |
-| Per-class target (`--per-class`) | 11,000 |
-| **Final balanced corpus** | **22,000 (11,000 / 11,000)** |
-| Distinct AI generator models represented | 44 |
-| Estimated upper bound per class (these sources) | ≈ 100,000 |
+| DroidCollection Python rows | 328,383 |
+| Dropped by label policy (refined + adversarial) | 81,976 (25.0%) |
+| Usable after label policy | 246,407 |
+| Removed — too short (< 10 tokens) | 1,544 |
+| Removed — label conflicts | 0 |
+| Removed — exact duplicates | 475 |
+| Unified filtered corpus | 244,388 (147,308 human / 97,080 AI) |
+| Per-class target (`--per-class`) | 50,000 |
+| **Final balanced corpus** | **100,000 (50,000 / 50,000)** |
+| Rejected during feature extraction | 5,892 (5.89%) — human 3.47%, AI 8.31% |
+| **Feature matrix** | **94,108 (48,264 human / 45,844 AI)** |
+| Rebalanced for Phase C | 91,688 (45,844/class) |
+| Distinct generators represented | 41 (24 with ≥ 500 surviving samples) |
+| Balanced ceiling for this corpus | 194,160 (97,080/class) |
