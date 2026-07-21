@@ -100,19 +100,29 @@ candidates from a grid. An arm could then "beat" the full model purely by drawin
 a luckier hyperparameter sample, and the delta would be uninterpretable.
 
 The parameters are lifted verbatim from the tuned full-feature droid-only run,
-`data/runs/2026-07-19T15-43-36Z_droid-only-qwen-qwen2-5-coder-32b-instruct/manifest.json`
+`data/runs/2026-07-21T18-32-13Z_droid50k-gpt4omini/manifest.json`
 (`headline.best_params`):
 
 ```python
-subsample=0.9, n_estimators=300, min_child_weight=1,
-max_depth=7, learning_rate=0.05, colsample_bytree=0.7
+subsample=0.9, n_estimators=200, min_child_weight=1,
+max_depth=10, learning_rate=0.05, colsample_bytree=0.8
 ```
 
-Note this is the **`headline`** block, not `shipped`. The two differ in that run
-(`shipped` tuned to `n_estimators=200, min_child_weight=5, max_depth=10,
-colsample_bytree=0.9`) because `ship()` re-runs the search over the full dataset.
-The headline block is the correct source: it is the configuration whose published
-metrics the ablation is measuring deltas against.
+Take them from the **`headline`** block, not `shipped`. `ship()` re-runs the
+search over the full dataset, so the two can diverge — in the earlier 7,400-row
+run they did (`headline` had `max_depth=7, colsample_bytree=0.7`; `shipped` had
+`max_depth=10, min_child_weight=5, colsample_bytree=0.9`). On the 90k corpus they
+converge exactly, which is itself a sign the search is no longer sample-starved.
+The headline block remains the correct source: it is the configuration whose
+published metrics the ablation measures deltas against.
+
+> **These are corpus-specific and go stale.** They must be re-derived from a
+> fresh Phase C run whenever the corpus changes. The first ablation (`s1`) was
+> run with parameters tuned on the 7,400-row corpus; moving to the 90k corpus
+> shifted them (`n_estimators` 300→200, `max_depth` 7→10, `colsample_bytree`
+> 0.7→0.8). Running an ablation against stale parameters does not invalidate the
+> arm *ranking* — see §9, where the ranking proved identical across both — but it
+> does make the magnitudes unattributable.
 
 **The bias this introduces, stated plainly.** These parameters were tuned for 16
 features. Reduced arms — especially `only_distribution` at 4 features — are
@@ -186,7 +196,11 @@ so the precision/recall trade is visible rather than asserted.
 | `only_stylometric` | 6 | How far F7–F12 get alone → sufficiency of stylometric |
 | `only_distribution` | 4 | How far F13–F16 get alone → sufficiency of distribution |
 
-7 arms × 5 seeds = **35 fits**, a few minutes on CPU.
+7 arms × 5 seeds = **35 fits**. This is **under a minute** on the 90k corpus
+(measured: 1.65 s per `full_16` fit at 66,015 × 16 on 12 cores). It is far
+cheaper than a Phase C run, which spends 250 fits on `RandomizedSearchCV` plus
+SHAP; the ablation does 35 plain fits with neither. Sixteen features is a small
+problem for XGBoost's `hist` method — a fast finish is expected, not a symptom.
 
 **Families are unequal (6 / 6 / 4) and deltas are reported raw**, not normalized
 per feature. Normalizing would imply features are interchangeable units, which
@@ -199,13 +213,27 @@ disclosed rather than corrected away.
 ## 7. Running it
 
 ```bash
-# Defaults: droidcollection only, 5% target FPR
-poetry run python scripts/run_family_ablation.py
+# The authoritative run (droid50k)
+poetry run python scripts/run_family_ablation.py \
+  --features data/processed/train_features_droid_50k.parquet \
+  --out data/runs/ablation_families/droid50k
 
-# Different operating point, or a different corpus slice
-poetry run python scripts/run_family_ablation.py --target-fpr 0.01
-poetry run python scripts/run_family_ablation.py --sources droidcollection aigcodeset
+# Different operating point
+poetry run python scripts/run_family_ablation.py \
+  --features data/processed/train_features_droid_50k.parquet \
+  --target-fpr 0.01 --out data/runs/ablation_families/droid50k-fpr01
 ```
+
+> **Always pass `--features`.** The default is
+> `data/processed/train_features.parquet` — the *superseded* pooled matrix (see
+> [dataset_construction.md](dataset_construction.md#8-superseded-the-three-source-build-22000-rows)).
+> Omitting the flag silently reruns the ablation on the wrong corpus, and nothing
+> in the output names the input.
+>
+> Name output directories for what varies (`droid50k-fpr01`), not by sequence
+> (`s2`). The six filenames are fixed, so two runs are indistinguishable once
+> separated from the command that produced them, and `config.json` records the
+> knobs but not the input matrix.
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -235,7 +263,131 @@ absent. It does **not** need a GPU — features already exist as numbers.
 > self-describing the way a `data/runs/` manifest is. Record the commit alongside
 > the output directory until this is wired into `common/provenance.py`.
 
-## 8. What this experiment does not answer
+## 8. Findings
+
+Two runs exist. Both ran on DroidCollection only, 5 seeds, fixed hyperparameters,
+threshold selected on validation at 5% FPR.
+
+| Run | Output | Corpus | Rows (train / test) | Parameters from |
+|---|---|---|---|---|
+| `s1` | `data/runs/ablation_families/s1` | 7,400-row droid slice of the pooled matrix | 5,328 / 1,480 | 7,400-row run |
+| `droid50k` | `data/runs/ablation_families/droid50k` | 91,688-row droid-only matrix | 66,015 / 18,338 | 90k run |
+
+`droid50k` is the authoritative run; `s1` is retained because the agreement
+between them is itself evidence (§9).
+
+### 8.1 Necessity and sufficiency separate cleanly
+
+From `droid50k` Table 1 (`full_16` AUROC **0.9539 ± 0.0019**):
+
+| Family | Necessary? (`drop_X`) | Sufficient? (`only_X`) | Verdict |
+|---|---|---|---|
+| **Stylometric** | **−0.1434** — severe | **0.9059** alone, −0.048 from full | **Backbone** |
+| **Perplexity** | **−0.0285** — real | **0.7705** alone, −0.183 from full | **Complement** |
+| **Distribution** | **−0.0070** — marginal | **0.6654** alone, −0.289 from full | **Largely redundant** |
+
+Stylometric is both necessary and sufficient, which is the unusual outcome: it
+carries most of the signal alone *and* cannot be removed without collapse.
+Perplexity is the mirror image — weak alone, but supplying information no other
+family holds. Distribution is neither.
+
+**Distribution is redundant with stylometric, not independently weak.**
+Triangulating: `drop_stylometric` (perplexity + distribution together) reaches
+0.8105, against `only_perplexity` at 0.7705 — so distribution contributes
+**+0.040** on top of perplexity alone. Added to the full set it contributes
+**+0.007**. Its information is almost entirely already present in stylometric,
+which fits the features themselves: F13–F16 are token-frequency statistics, and
+F8 (identifier diversity) already encodes much of that.
+
+This confirms and extends the SHAP ranking, where F9 and F10 take the top two
+slots. SHAP reports what the model *used*; the ablation adds what SHAP cannot —
+that perplexity is **non-redundant** despite ranking mid-table, and that
+distribution is redundant despite being used.
+
+### 8.2 AUROC understates every family's contribution at the operating point
+
+This is the result that changes a decision. Comparing relative loss in AUROC
+against relative loss in recall at 5% FPR:
+
+| Arm | ΔAUROC | ΔRecall @5% FPR | Amplification |
+|---|---:|---:|---:|
+| `drop_distribution` | −0.7% | **−4.1%** | ×5.6 |
+| `drop_perplexity` | −3.0% | **−17.7%** | ×5.9 |
+| `drop_stylometric` | −15.0% | **−43.9%** | ×2.9 |
+| `only_stylometric` | −5.0% | **−29.5%** | ×5.9 |
+| `only_perplexity` | −19.2% | **−53.0%** | ×2.8 |
+| `only_distribution` | −30.2% | **−71.0%** | ×2.3 |
+
+Every arm loses substantially more recall than AUROC suggests. The cause is
+structural: AUROC integrates over all thresholds, including the high-FPR region
+Deltx will never operate in. At 5% FPR the model works in the extreme tail of the
+human score distribution, and that is exactly where the marginal families do
+their work — separating the *hardest* human samples, the ones stylometry alone
+finds ambiguous. Treat this as a general property of low-FPR operation, not a
+per-family quirk.
+
+**Consequence: the GPU in Phase B is justified.** §1 framed the practical stake
+as whether F1–F6 could be dropped, collapsing feature extraction from a GPU job
+to a CPU pass. On AUROC alone, −3.0% looks cheap. At the operating point it costs
+**17.7% of AI detections**. Keep the perplexity family.
+
+**Distribution stays too**, for the opposite reason. Its −0.7% AUROC cost is
+statistically real (95% CI ±0.0005, excluding zero) but practically negligible —
+yet the features are pure CPU token-counting. Pruning them would save nothing
+measurable and forfeit 4.1% recall.
+
+### 8.3 Threshold sensitivity
+
+From `droid50k` Table 3: at the conventional 0.5 threshold the full model runs at
+**12.0% FPR** — roughly one human file in eight flagged. F1 peaks broadly around
+0.40–0.50 (0.8865), but only at 13–15% FPR. Reaching 5% FPR requires a threshold
+near 0.78 and costs recall (0.766).
+
+There is no threshold that is simultaneously good on F1 and defensible on false
+positives. That is the argument for reporting at a **stated FPR** rather than at
+a convention. It does not affect Stage 4, which consumes `ai_confidence` as a
+continuous signal.
+
+## 9. Cross-run agreement, and what scale changed
+
+`s1` and `droid50k` differ in two variables at once — corpus size (12×) and
+re-tuned hyperparameters — so magnitudes are not directly attributable. The
+*structure*, however, is unchanged, and that is the useful comparison.
+
+**The arm ranking is identical** — in both runs, and across all five seeds within
+each run. Seven arms ordered the same way ten times over.
+
+| Arm | `s1` AUROC | `droid50k` AUROC | `s1` Δrecall | `droid50k` Δrecall |
+|---|---:|---:|---:|---:|
+| `full_16` | 0.9414 | **0.9539** | — | — |
+| `drop_distribution` | 0.9363 | 0.9470 | −8.0% | −4.1% |
+| `drop_perplexity` | 0.9060 | 0.9255 | −25.8% | −17.7% |
+| `drop_stylometric` | 0.7868 | 0.8105 | −49.0% | −43.9% |
+| `only_stylometric` | 0.8920 | 0.9059 | −37.5% | −29.5% |
+| `only_perplexity` | 0.7486 | 0.7705 | −59.5% | −53.0% |
+| `only_distribution` | 0.6520 | 0.6654 | −71.0% | −71.0% |
+
+Three things scale changed:
+
+1. **Every arm improved**, and reduced arms improved most in relative terms — more
+   data lets a smaller feature set recover more of the full model's performance.
+   The qualitative conclusions are unaffected.
+2. **Confidence intervals collapsed** — `drop_perplexity`'s 95% CI on ΔAUROC went
+   from ±0.0044 to **±0.0005**. Differences that s1 could not resolve are now
+   resolvable.
+3. **Threshold calibration tightened.** §5 flagged that s1's validation split held
+   only ~296 negatives, making the 95th-percentile estimate noisy: achieved test
+   FPR ranged **4.6%–7.0%** against a 5% target. With ~3,667 validation negatives,
+   `droid50k` achieves **4.55%–5.70%** (mean 4.96%). The caveat raised in s1 is
+   resolved rather than merely inherited.
+
+**Still a lower bound: `only_distribution`.** Per §3, four features under
+`colsample_bytree=0.8` sample ~3 columns per tree. Its 0.6654 remains the
+weakest-supported number in the table. It would have to gain ~0.29 AUROC to
+change any conclusion, so this does not threaten the findings — but do not quote
+it as a precise estimate of what distribution features can achieve.
+
+## 10. What this experiment does not answer
 
 Stated so nobody over-reads the report:
 
