@@ -74,15 +74,18 @@ FAMILIES = {
 }
 ALL_FEATURES = PERPLEXITY + STYLOMETRIC + DISTRIBUTION
 
-# Tuned on the full-feature droidcollection-only run
-# (data/runs/2026-07-19T15-43-36Z_droid-only-*/manifest.json).
+# Tuned on the full-feature droidcollection-only run, headline block
+# (data/runs/2026-07-21T18-32-13Z_droid50k-gpt4omini/manifest.json).
+# Refresh these whenever the corpus changes: they were previously taken from the
+# 7,400-row run, and re-tuning on the 90k corpus moved n_estimators 300->200,
+# max_depth 7->10 and colsample_bytree 0.7->0.8.
 FIXED_PARAMS = {
     "subsample": 0.9,
-    "n_estimators": 300,
+    "n_estimators": 200,
     "min_child_weight": 1,
-    "max_depth": 7,
+    "max_depth": 10,
     "learning_rate": 0.05,
-    "colsample_bytree": 0.7,
+    "colsample_bytree": 0.8,
     "objective": "binary:logistic",
     "eval_metric": "logloss",
     "tree_method": "hist",
